@@ -1,7 +1,9 @@
 ﻿from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, TypedDict
+
+from langgraph.graph import END, START, StateGraph
 
 from agent_runtime import agent
 from db import ResearchDB
@@ -55,55 +57,94 @@ REPORT_POLISH_SYSTEM = """你是 KaggleForge 的 Report Polish agent。
 输出完整 Markdown 正文，不要输出 JSON，不要解释修改过程。"""
 
 
+class ReportGraphState(TypedDict, total=False):
+    context_data: dict[str, Any]
+    context_markdown: str
+    draft: str
+    review: dict[str, Any]
+    final: str
+
+
 class ReportStage(Stage):
     def __init__(self, db: ResearchDB) -> None:
         super().__init__("report")
         self.db = db
 
     async def execute(self) -> str:
+        graph = StateGraph(ReportGraphState)
+        graph.add_node("collect", self._collect_node)
+        graph.add_node("writer", self._writer_node)
+        graph.add_node("reviewer", self._reviewer_node)
+        graph.add_node("polish", self._polish_node)
+        graph.add_edge(START, "collect")
+        graph.add_edge("collect", "writer")
+        graph.add_edge("writer", "reviewer")
+        graph.add_edge("reviewer", "polish")
+        graph.add_edge("polish", END)
+        result = await graph.compile().ainvoke({})
+        return str(result.get("final", ""))
+
+    async def _collect_node(self, state: ReportGraphState) -> ReportGraphState:
         print("[report] collect context")
         self.emit(phase="collect", status="running")
         context = self._build_report_context()
         self.db.save_json("report_context.json", context["data"])
         self.db.save_text("report_context.md", context["markdown"])
         self.emit(phase="collect", status="completed")
+        return {"context_data": context["data"], "context_markdown": context["markdown"]}
 
+    async def _writer_node(self, state: ReportGraphState) -> ReportGraphState:
         print("[report] writer")
         self.emit(phase="writer", status="running")
         draft = await agent(
             REPORT_WRITER_SYSTEM,
-            context["markdown"],
+            str(state.get("context_markdown", "")),
             cwd=self.db.session_dir,
             on_event=self.agent_output_sink("writer"),
+            node_name="report.writer",
         )
         self.db.save_paper(draft)
         self.emit(phase="writer", status="completed")
+        return {"draft": draft}
 
+    async def _reviewer_node(self, state: ReportGraphState) -> ReportGraphState:
         print("[report] reviewer")
         self.emit(phase="reviewer", status="running")
         review_raw = await agent(
             REPORT_REVIEWER_SYSTEM,
-            self._build_review_user(context["markdown"], draft),
+            self._build_review_user(
+                str(state.get("context_markdown", "")), str(state.get("draft", ""))
+            ),
             cwd=self.db.session_dir,
             on_event=self.agent_output_sink("reviewer"),
+            node_name="report.reviewer",
         )
         review = self._normalize_review(parse_json_fenced(review_raw, default={}))
         self.db.save_text("report_review.md", review_raw)
         self.db.save_json("report_review.json", review)
         self.emit(phase="reviewer", status="completed", review=review)
+        return {"review": review}
 
+    async def _polish_node(self, state: ReportGraphState) -> ReportGraphState:
         print("[report] polish")
         self.emit(phase="polish", status="running")
         final = await agent(
             REPORT_POLISH_SYSTEM,
-            self._build_polish_user(context["markdown"], draft, review),
+            self._build_polish_user(
+                str(state.get("context_markdown", "")),
+                str(state.get("draft", "")),
+                state.get("review", {}),
+            ),
             cwd=self.db.session_dir,
             on_event=self.agent_output_sink("polish"),
+            node_name="report.polish",
         )
-        final = final.rstrip() + "\n\n" + self._build_metadata_appendix(context["data"])
+        final = final.rstrip() + "\n\n" + self._build_metadata_appendix(
+            state.get("context_data", {})
+        )
         self.db.save_paper_polished(final)
         self.emit(phase="polish", status="completed")
-        return final
+        return {"final": final}
 
     def _build_report_context(self) -> dict[str, Any]:
         tasks = self.db.get_plan()

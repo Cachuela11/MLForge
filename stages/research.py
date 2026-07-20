@@ -2,11 +2,13 @@
 
 import asyncio
 import json
-import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
+
+from langgraph.graph import END, START, StateGraph
 
 from agent_runtime import agent
+from agent_harness import default_harness
 from config import settings
 from db import ResearchDB
 from prompts import (
@@ -20,6 +22,26 @@ from stage import Stage
 from utils import parse_json_fenced
 
 
+class ResearchGraphState(TypedDict, total=False):
+    strategy: str
+    plan: list[dict[str, Any]]
+    completed: list[dict[str, Any]]
+    evaluation: dict[str, Any]
+    summary: str
+
+
+class TaskGraphState(TypedDict, total=False):
+    task: dict[str, Any]
+    completed: dict[str, dict[str, Any]]
+    workspace: str
+    attempt: int
+    max_attempts: int
+    output: str
+    previous_output: str
+    retry_review: str
+    verification: dict[str, Any]
+
+
 class ResearchStage(Stage):
     def __init__(self, db: ResearchDB) -> None:
         super().__init__("research")
@@ -28,25 +50,62 @@ class ResearchStage(Stage):
     async def execute(self) -> str:
         self.db.artifacts_dir()
 
+        graph = StateGraph(ResearchGraphState)
+        graph.add_node("strategy", self._strategy_node)
+        graph.add_node("decompose", self._decompose_node)
+        graph.add_node("execute_verify", self._execute_verify_node)
+        graph.add_node("evaluate", self._evaluate_node)
+        graph.add_node("summarize", self._summarize_node)
+        graph.add_edge(START, "strategy")
+        graph.add_edge("strategy", "decompose")
+        graph.add_edge("decompose", "execute_verify")
+        graph.add_edge("execute_verify", "evaluate")
+        graph.add_edge("evaluate", "summarize")
+        graph.add_edge("summarize", END)
+        result = await graph.compile().ainvoke({})
+        return str(result.get("summary", ""))
+
+    async def _strategy_node(self, state: ResearchGraphState) -> ResearchGraphState:
         print("[research] strategy")
         self.emit(phase="strategy", status="running")
         strategy = await self._strategy()
         self.emit(phase="strategy", status="completed")
+        return {"strategy": strategy}
+
+    async def _decompose_node(self, state: ResearchGraphState) -> ResearchGraphState:
+        strategy = str(state.get("strategy", ""))
         print("[research] decompose")
         self.emit(phase="decompose", status="running")
         plan = await self._decompose(strategy)
         self.emit(phase="decompose", status="completed")
+        return {"plan": plan}
+
+    async def _execute_verify_node(self, state: ResearchGraphState) -> ResearchGraphState:
+        plan = state.get("plan", [])
         print("[research] execute + verify")
         self.emit(phase="execute", status="running")
         completed = await self._execute_and_verify(plan)
         self.emit(phase="execute", status="completed")
+        return {"completed": completed, "plan": plan}
+
+    async def _evaluate_node(self, state: ResearchGraphState) -> ResearchGraphState:
+        strategy = str(state.get("strategy", ""))
+        plan = state.get("plan", [])
+        completed = state.get("completed", [])
         print("[research] evaluate")
         self.emit(phase="evaluate", status="running")
         evaluation = await self._evaluate(strategy, plan, completed)
         self.emit(phase="evaluate", status="completed")
+        return {"evaluation": evaluation}
+
+    async def _summarize_node(self, state: ResearchGraphState) -> ResearchGraphState:
+        strategy = str(state.get("strategy", ""))
+        plan = state.get("plan", [])
+        completed = state.get("completed", [])
+        evaluation = state.get("evaluation", {})
         summary = self._build_results_summary(strategy, plan, completed, evaluation)
         self.db.save_results_summary(summary["data"], summary["markdown"])
-        return summary["markdown"]
+        return {"summary": summary["markdown"]}
 
     async def _strategy(self) -> str:
         existing = self.db.get_strategy()
@@ -58,6 +117,7 @@ class ResearchStage(Stage):
             self._build_strategy_user(),
             cwd=self.db.session_dir,
             on_event=self.agent_output_sink("strategy"),
+            node_name="research.strategy",
         )
         self.db.save_strategy(strategy)
         return strategy
@@ -72,6 +132,7 @@ class ResearchStage(Stage):
             self._build_decompose_user(strategy),
             cwd=self.db.session_dir,
             on_event=self.agent_output_sink("decompose"),
+            node_name="research.decompose",
         )
         data = parse_json_fenced(response, default={})
         tasks = self._normalize_tasks(data.get("tasks", []))
@@ -149,9 +210,15 @@ class ResearchStage(Stage):
                         had_recompose = True
                         continue
 
-                    completed[task_id] = result
                     passed = bool(verification.get("pass"))
                     task["status"] = "completed" if passed else "failed"
+                    if not passed:
+                        self.db.save_plan(tasks)
+                        raise RuntimeError(
+                            f"Task {task_id} failed verification after all attempts: "
+                            f"{verification.get('review', '')}"
+                        )
+                    completed[task_id] = result
                     task["summary"] = result.get("summary", "")
                     self.emit(phase="execute", status="completed", task_id=task_id)
 
@@ -190,91 +257,29 @@ class ResearchStage(Stage):
                 task=task,
                 workspace=str(workspace),
             )
-
-            output = self.db.get_task_output(task_id)
-            verification = self.db.get_verification(task_id)
-            max_attempts = max(1, settings.task_max_attempts)
-            previous_output = output
-            retry_review = str(verification.get("review", "")) if verification else ""
-            final_output = output
-            final_verification = verification
-
-            for attempt in range(1, max_attempts + 1):
-                should_execute = not final_output or (
-                    attempt > 1 and not final_verification.get("pass", False)
-                )
-                if should_execute:
-                    self.emit(
-                        phase="execute",
-                        status="running",
-                        task_id=task_id,
-                        task=task,
-                        attempt=attempt,
-                        max_attempts=max_attempts,
-                        workspace=str(workspace),
-                    )
-                    final_output = await agent(
-                        EXECUTE_SYSTEM,
-                        self._build_workspace_execute_user(
-                            task,
-                            completed,
-                            workspace,
-                            attempt=attempt,
-                            previous_output=previous_output,
-                            retry_review=retry_review,
-                        ),
-                        cwd=workspace,
-                        on_event=self.agent_output_sink("execute", task_id=task_id),
-                    )
-                    self.db.save_task_output(task_id, final_output)
-                    self.db.save_text(
-                        f"tasks/{self.db.safe_id(task_id)}.attempt_{attempt}.md",
-                        final_output,
-                    )
-
-                self._sync_task_artifacts(task_id, workspace)
-
-                if not final_verification or should_execute:
-                    print(f"[research] verify task {task_id} attempt {attempt}")
-                    self.emit(
-                        phase="verify",
-                        status="running",
-                        task_id=task_id,
-                        task=task,
-                        attempt=attempt,
-                        max_attempts=max_attempts,
-                    )
-                    final_verification = await self._verify(task, final_output)
-                    self.db.save_verification(task_id, final_verification)
-                    self.db.save_json(
-                        f"verifications/{self.db.safe_id(task_id)}.attempt_{attempt}.json",
-                        final_verification,
-                    )
-                    self.emit(
-                        phase="verify",
-                        status="completed",
-                        task_id=task_id,
-                        verification=final_verification,
-                        attempt=attempt,
-                    )
-
-                if final_verification.get("pass"):
-                    break
-                if final_verification.get("redecompose"):
-                    break
-
-                previous_output = final_output
-                retry_review = str(final_verification.get("review", ""))
-                if attempt < max_attempts:
-                    self.emit(
-                        phase="execute",
-                        status="retrying",
-                        task_id=task_id,
-                        attempt=attempt + 1,
-                        max_attempts=max_attempts,
-                        review=retry_review,
-                    )
-
+            graph = StateGraph(TaskGraphState)
+            graph.add_node("execute", self._task_execute_node)
+            graph.add_node("verify", self._task_verify_node)
+            graph.add_edge(START, "execute")
+            graph.add_edge("execute", "verify")
+            graph.add_conditional_edges(
+                "verify",
+                self._route_after_task_verification,
+                {"retry": "execute", "done": END},
+            )
+            result = await graph.compile().ainvoke(
+                {
+                    "task": task,
+                    "completed": completed,
+                    "workspace": str(workspace),
+                    "attempt": 0,
+                    "max_attempts": max(1, settings.task_max_attempts),
+                    "output": self.db.get_task_output(task_id),
+                    "verification": self.db.get_verification(task_id),
+                }
+            )
+            final_output = str(result.get("output", ""))
+            final_verification = result.get("verification", {})
             return {
                 "task": task,
                 "output": final_output,
@@ -282,12 +287,111 @@ class ResearchStage(Stage):
                 "summary": self._extract_summary(final_output),
             }
 
+    async def _task_execute_node(self, state: TaskGraphState) -> TaskGraphState:
+        task = state["task"]
+        task_id = str(task["id"])
+        attempt = int(state.get("attempt", 0)) + 1
+        max_attempts = int(state.get("max_attempts", 1))
+        workspace = Path(str(state["workspace"]))
+        previous_output = str(state.get("output", ""))
+        previous_verification = state.get("verification", {})
+        retry_review = str(previous_verification.get("review", ""))
+        self.emit(
+            phase="execute",
+            status="running",
+            task_id=task_id,
+            task=task,
+            attempt=attempt,
+            max_attempts=max_attempts,
+            workspace=str(workspace),
+        )
+        output = await agent(
+            EXECUTE_SYSTEM,
+            self._build_workspace_execute_user(
+                task,
+                state.get("completed", {}),
+                workspace,
+                attempt=attempt,
+                previous_output=previous_output,
+                retry_review=retry_review,
+            ),
+            cwd=workspace,
+            on_event=self.agent_output_sink("execute", task_id=task_id),
+            node_name="research.execute",
+            run_id=f"research.execute.{self.db.safe_id(task_id)}.attempt_{attempt}",
+            attempt=attempt,
+            metadata={"task_id": task_id},
+        )
+        self.db.save_task_output(task_id, output)
+        self.db.save_text(
+            f"tasks/{self.db.safe_id(task_id)}.attempt_{attempt}.md", output
+        )
+        self._sync_task_artifacts(task_id, workspace)
+        return {
+            "attempt": attempt,
+            "previous_output": previous_output,
+            "output": output,
+            "retry_review": retry_review,
+            "verification": {},
+        }
+
+    async def _task_verify_node(self, state: TaskGraphState) -> TaskGraphState:
+        task = state["task"]
+        task_id = str(task["id"])
+        attempt = int(state.get("attempt", 1))
+        max_attempts = int(state.get("max_attempts", 1))
+        print(f"[research] verify task {task_id} attempt {attempt}")
+        self.emit(
+            phase="verify",
+            status="running",
+            task_id=task_id,
+            task=task,
+            attempt=attempt,
+            max_attempts=max_attempts,
+        )
+        verification = await self._verify(task, str(state.get("output", "")))
+        self.db.save_verification(task_id, verification)
+        self.db.save_json(
+            f"verifications/{self.db.safe_id(task_id)}.attempt_{attempt}.json",
+            verification,
+        )
+        self.emit(
+            phase="verify",
+            status="completed",
+            task_id=task_id,
+            verification=verification,
+            attempt=attempt,
+        )
+        return {
+            "verification": verification,
+            "retry_review": str(verification.get("review", "")),
+        }
+
+    def _route_after_task_verification(self, state: TaskGraphState) -> str:
+        verification = state.get("verification", {})
+        if verification.get("pass") or verification.get("redecompose"):
+            return "done"
+        attempt = int(state.get("attempt", 1))
+        max_attempts = int(state.get("max_attempts", 1))
+        if attempt < max_attempts:
+            self.emit(
+                phase="execute",
+                status="retrying",
+                task_id=str(state.get("task", {}).get("id", "")),
+                attempt=attempt + 1,
+                max_attempts=max_attempts,
+                review=str(verification.get("review", "")),
+            )
+            return "retry"
+        return "done"
+
     async def _verify(self, task: dict[str, Any], output: str) -> dict[str, Any]:
         response = await agent(
             VERIFY_SYSTEM,
             self._build_verify_user(task, output),
             cwd=self.db.session_dir,
             on_event=self.agent_output_sink("verify", task_id=str(task.get("id", ""))),
+            node_name="research.verify",
         )
         data = parse_json_fenced(response, default={})
         if "pass" not in data:
@@ -317,6 +421,7 @@ class ResearchStage(Stage):
             self._build_evaluate_user(strategy, plan, completed),
             cwd=self.db.session_dir,
             on_event=self.agent_output_sink("evaluate"),
+            node_name="research.evaluate",
         )
         data = parse_json_fenced(response, default={})
         evaluation = {
@@ -461,8 +566,7 @@ class ResearchStage(Stage):
     ) -> Path:
         task_id = task["id"]
         workspace = self.db.task_workspace_dir(task_id)
-        (workspace / "artifacts").mkdir(parents=True, exist_ok=True)
-
+        context_files: dict[Path, str] = {}
         for name in (
             "source.md",
             "task.md",
@@ -476,16 +580,12 @@ class ResearchStage(Stage):
         ):
             src = self.db.session_dir / name
             if src.exists() and src.is_file():
-                shutil.copy2(src, workspace / name)
+                context_files[src] = name
 
         current_task = dict(task)
         current_task["workspace"] = str(workspace)
         current_task["session_dir"] = str(self.db.session_dir)
         current_task["dataset_dir"] = str(settings.dataset_dir)
-        (workspace / "current_task.json").write_text(
-            json.dumps(current_task, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
 
         dependency_lines = []
         for dep_id in task.get("dependencies", []):
@@ -502,28 +602,25 @@ class ResearchStage(Stage):
                     "",
                 ]
             )
-        (workspace / "dependencies.md").write_text(
-            "\n".join(dependency_lines) or "(none)\n",
-            encoding="utf-8",
+        default_harness.prepare_workspace(
+            workspace,
+            context_files=context_files,
+            generated_files={
+                "current_task.json": json.dumps(
+                    current_task, indent=2, ensure_ascii=False
+                ),
+                "dependencies.md": "\n".join(dependency_lines) or "(none)\n",
+            },
         )
         return workspace
 
     def _sync_task_artifacts(self, task_id: str, workspace: Path) -> None:
-        source = workspace / "artifacts"
-        if not source.exists():
-            return
-        target = self.db.task_artifacts_dir(task_id)
         safe_id = self.db.safe_id(task_id)
-        for path in sorted(source.rglob("*")):
-            if not path.is_file():
-                continue
-            rel = path.relative_to(source)
-            parts = rel.parts
-            if parts and parts[0] in {safe_id, str(task_id)}:
-                rel = Path(*parts[1:]) if len(parts) > 1 else Path(path.name)
-            dest = target / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, dest)
+        default_harness.sync_artifacts(
+            workspace,
+            self.db.task_artifacts_dir(task_id),
+            strip_top_level={safe_id, str(task_id)},
+        )
 
     async def _redecompose_task(
         self,
@@ -541,6 +638,8 @@ class ResearchStage(Stage):
             user_text,
             cwd=self.db.session_dir,
             on_event=self.agent_output_sink("decompose", task_id=task_id),
+            node_name="research.redecompose",
+            metadata={"task_id": task_id},
         )
         data = parse_json_fenced(response, default={})
         raw_children = data.get("tasks", [])

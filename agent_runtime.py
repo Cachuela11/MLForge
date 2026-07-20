@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from config import settings
+from agent_harness import AgentRunSpec, default_harness
 from codex_runtime import CodexCliRuntime
 
 
@@ -14,6 +15,10 @@ async def agent(
     *,
     cwd: Path,
     on_event: Callable[[dict[str, Any]], None] | None = None,
+    node_name: str = "agent",
+    run_id: str = "",
+    attempt: int = 1,
+    metadata: dict[str, Any] | None = None,
 ) -> str:
     """Run one workflow node as an agent call.
 
@@ -27,34 +32,19 @@ async def agent(
     to save it.
     """
 
-    runtime = settings.runtime.lower()
-    if runtime == "codex":
-        codex = CodexCliRuntime(
-            codex_bin=settings.codex_bin,
-            model=settings.codex_model,
-            reasoning_effort=settings.codex_reasoning_effort,
-            verbosity=settings.codex_verbosity,
-            sandbox=settings.codex_sandbox,
-            timeout=settings.codex_timeout,
-            inherit_proxy=settings.codex_inherit_proxy,
-            sandbox_provider=settings.codex_sandbox_provider,
-            docker_image=settings.codex_docker_image,
-            docker_bin=settings.codex_docker_bin,
-            docker_codex_bin=settings.codex_docker_codex_bin,
-            docker_gpus=settings.codex_docker_gpus,
-        )
-        return await codex.run(
-            instruction=system_prompt,
+    result = await default_harness.run(
+        AgentRunSpec(
+            system_prompt=system_prompt,
             user_text=user_text,
-            cwd=cwd,
-            on_event=on_event,
-        )
-
-    return (
-        f"{system_prompt.strip()}\n\n"
-        "Generated from input:\n"
-        f"{user_text.strip()}\n"
+            workspace=cwd,
+            node_name=node_name,
+            run_id=run_id,
+            attempt=attempt,
+            metadata=metadata or {},
+        ),
+        on_event=on_event,
     )
+    return result.final_text
 
 
 def codex_status() -> dict[str, str | bool]:

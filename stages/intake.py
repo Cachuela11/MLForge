@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from typing import TypedDict
+
+from langgraph.graph import END, START, StateGraph
 
 from agent_runtime import agent
 from config import settings
@@ -14,15 +17,34 @@ from prompts import CALIBRATE_SYSTEM
 from stage import Stage
 
 
+class IntakeGraphState(TypedDict, total=False):
+    task: str
+    calibration: str
+
+
 class IntakeStage(Stage):
     def __init__(self, db: ResearchDB) -> None:
         super().__init__("intake")
         self.db = db
 
     async def execute(self) -> str:
+        graph = StateGraph(IntakeGraphState)
+        graph.add_node("load_kaggle", self._load_kaggle_node)
+        graph.add_node("calibrate", self._calibrate_node)
+        graph.add_edge(START, "load_kaggle")
+        graph.add_edge("load_kaggle", "calibrate")
+        graph.add_edge("calibrate", END)
+        result = await graph.compile().ainvoke({})
+        return str(result.get("calibration", ""))
+
+    async def _load_kaggle_node(self, state: IntakeGraphState) -> IntakeGraphState:
         self.emit(phase="kaggle", status="running")
         task = await self._load_kaggle_task()
         self.emit(phase="kaggle", status="completed")
+        return {"task": task}
+
+    async def _calibrate_node(self, state: IntakeGraphState) -> IntakeGraphState:
+        task = str(state.get("task", ""))
         calibration = self.db.get_calibration()
 
         if not calibration:
@@ -32,13 +54,14 @@ class IntakeStage(Stage):
                 self._build_calibrate_user(task),
                 cwd=self.db.session_dir,
                 on_event=self.agent_output_sink("calibrate"),
+                node_name="intake.calibrate",
             )
             self.db.save_calibration(calibration)
             self.emit(phase="calibrate", status="completed")
         else:
             self.emit(phase="calibrate", status="completed", cached=True)
 
-        return calibration
+        return {"calibration": calibration}
 
     async def _load_kaggle_task(self) -> str:
         raw_input = self.db.get_source()

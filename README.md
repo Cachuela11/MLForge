@@ -28,8 +28,15 @@ KaggleForge 自己负责 workflow 编排、文件状态管理、前端展示和�
 - `stages/research.py`: strategy、decompose、execute、verify、evaluate。
 - `db.py`: 文件型 session 存储，结果写入 `results/<date>-<competition>/`。
 - `agent_runtime.py`: agent 调用入口。
+- `agent_harness.py`: 单次 agent run 的统一执行契约，负责 runtime 适配、workspace 装配、artifact 同步、标准事件和审计记录。
 - `codex_runtime.py`: Codex CLI 调用封装。
 - `frontend/`: 原生 HTML / CSS / JS 前端。
+
+## Workflow 与 Runtime 分层
+
+三个 Stage 的内部节点统一使用 LangGraph 调度：Intake 管理 fetch/calibrate，Research 管理 strategy/decompose/execute-verify/evaluate，并用 task 子图处理 verify 后的 retry 或 redecompose，Report 管理 collect/writer/reviewer/polish。Stage 间仍由轻量 Orchestrator 按顺序推进。
+
+LangGraph 只负责工作流路由；Agent Harness 负责可靠执行一次 agent 节点；Codex Runtime 只负责一次 Codex CLI 进程。每次 Harness 执行会在 workspace 的 `.harness/runs/<run_id>/` 保存 spec、result 和 output，便于追踪与审计。
 
 ## Agent 运行流程框架
 
